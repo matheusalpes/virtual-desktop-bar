@@ -307,11 +307,11 @@ Component {
                 }
 
                 if (mouse.button == Qt.LeftButton) {
-                    backend.showDesktop(number);
+                    backend.showDesktop(id);
                 } else if (mouse.button == Qt.MiddleButton) {
                     if (!config.DynamicDesktopsEnable &&
                         config.MouseWheelRemoveDesktopOnClick) {
-                        backend.removeDesktop(number);
+                        backend.removeDesktop(id);
                     }
                 }
             }

@@ -3,7 +3,7 @@ project(VirtualDesktopBar)
 
 set(CMAKE_CXX_FLAGS "-Wall -Wextra")
 set(CMAKE_CXX_FLAGS_DEBUG "-g")
-set(CMAKE_CXX_FLAGS_RELEASE "-O3")
+#set(CMAKE_CXX_FLAGS_RELEASE "-O3")
 
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE "Release")
@@ -49,11 +49,17 @@ find_package(Qt5 ${REQUIRED_QT_VERSION}
 find_package(KF5 ${KF5_MIN_VERSION}
              REQUIRED COMPONENTS
              Plasma
+             Wayland
              WindowSystem
              GlobalAccel
              XmlGui)
 
+find_package(LibTaskManager "5.24.0" # Replace literal appropriate with variable
+             CONFIG REQUIRED)
+
 plasma_install_package(package org.kde.plasma.virtualdesktopbar)
+
+include_directories("/usr/include/taskmanager" ${KF5WaylandClient_INCLUDE_DIRS}) # Replace literal with appropriate variable
 
 set(virtualdesktopbar_SRCS
     plugin/DesktopInfo.cpp
@@ -67,9 +73,11 @@ target_link_libraries(virtualdesktopbar
                       Qt5::Qml
                       Qt5::X11Extras
                       KF5::Plasma
+                      KF5::WaylandClient
                       KF5::WindowSystem
                       KF5::GlobalAccel
-                      KF5::XmlGui)
+                      KF5::XmlGui
+                      PW::LibTaskManager)
 
 install(TARGETS virtualdesktopbar DESTINATION ${KDE_INSTALL_QMLDIR}/org/kde/plasma/virtualdesktopbar)
 install(FILES plugin/qmldir DESTINATION ${KDE_INSTALL_QMLDIR}/org/kde/plasma/virtualdesktopbar)

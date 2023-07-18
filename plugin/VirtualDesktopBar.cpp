@@ -1,40 +1,160 @@
 #include "VirtualDesktopBar.hpp"
 
 #include <functional>
+#include <thread>
+#include <chrono>
 
 #include <QGuiApplication>
 #include <QRegularExpression>
 #include <QScreen>
 #include <QTimer>
 #include <QX11Info>
+#include <QThread>
 
 #include <KGlobalAccel>
+#include <KX11Extras>
+
+TaskManager::VirtualDesktopInfo *VirtualDesktopBar::vdi = nullptr;
+
+using namespace KWayland::Client;
 
 VirtualDesktopBar::VirtualDesktopBar(QObject* parent) : QObject(parent),
-        netRootInfo(QX11Info::connection(), 0),
         dbusInterface("org.kde.KWin", "/VirtualDesktopManager"),
         dbusInterfaceName("org.kde.KWin.VirtualDesktopManager"),
         sendDesktopInfoListLock(false),
         tryAddEmptyDesktopLock(false),
         tryRemoveEmptyDesktopsLock(false),
-        tryRenameEmptyDesktopsLock(false),
-        currentDesktopNumber(KWindowSystem::currentDesktop()),
-        mostRecentDesktopNumber(currentDesktopNumber) {
+        tryRenameEmptyDesktopsLock(false) {
 
-    setUpSignals();
-    setUpGlobalKeyboardShortcuts();
+    if (KWindowSystem::isPlatformWayland()) {
+        initWaylandConnection();
+    }
+    else if (KWindowSystem::isPlatformX11()) {
+        netRootInfo = new NETRootInfo(QX11Info::connection(), QFlag(0));
+    }
+
+    vdi = new TaskManager::VirtualDesktopInfo();
+    currentDesktop = vdi->currentDesktop();
+    mostRecentDesktop = currentDesktop;
+
+    setupSignals();
+    setupGlobalKeyboardShortcuts();
+}
+
+VirtualDesktopBar::~VirtualDesktopBar() noexcept
+{
+    if (netRootInfo) {
+        delete netRootInfo;
+        netRootInfo = nullptr;
+    }
+    if (vdi) {
+        delete vdi;
+        vdi = nullptr;
+    }
+    if (waylandConn) {
+        waylandConn->deleteLater();
+        connThread->quit();
+        connThread->wait();
+    }
+}
+
+#include <iostream>
+void VirtualDesktopBar::initWaylandRegistry() {
+    waylandReg = new Registry();
+    waylandReg->create(waylandConn);
+
+    connect(waylandReg, &Registry::plasmaVirtualDesktopManagementAnnounced,
+            [this](qint32 n, qint32 v) {
+                pvdName = n;
+                pvdVersion = v;
+            });
+
+    connect(waylandReg, &Registry::plasmaVirtualDesktopManagementRemoved,
+            [this](qint32 n) {
+                if (n != pvdName)
+                    return;
+                pvdName = 0;
+                pvdVersion = 0;
+            });
+
+    connect(waylandReg, &Registry::plasmaWindowManagementAnnounced,
+            [this](qint32 n, qint32 v) {
+                pwmName = n;
+                pwmVersion = v;
+            });
+
+    connect(waylandReg, &Registry::plasmaWindowManagementRemoved,
+            [this](qint32 n) {
+                if (n != pwmName)
+                    return;
+                pwmName = 0;
+                pwmVersion = 0;
+            });
+
+    connect(waylandConn, &ConnectionThread::connectionDied, waylandReg, &Registry::destroy);
+    waylandReg->setup();
+    waylandConn->roundtrip();
+
+    // Wait for Announcements
+    while (pvdName == 0 && pvdVersion == 0 && pwmName == 0 && pwmVersion == 0) {
+        // TODO: Add some sort of timeout here so this isn't a potential infinite loop'
+        std::this_thread::yield();
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+}
+
+void VirtualDesktopBar::initWaylandConnection() {
+    // Set up Wayland socket connection
+    waylandConn = new ConnectionThread();
+    connThread = new QThread();
+    waylandConn->moveToThread(connThread);
+    connThread->start();
+
+    bool isReady = false;
+    connect(waylandConn, &ConnectionThread::connected, [&isReady] {
+        isReady = true;
+    });
+
+    connect(waylandConn, &ConnectionThread::failed, [&isReady] {
+        isReady = true;
+    });
+
+    waylandConn->initConnection();
+
+    while (!isReady) {
+        std::this_thread::yield();
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    initWaylandRegistry();
+
+    // Set up PlasmaVirtualDesktopManagement
+    waylandPvdm = waylandReg->createPlasmaVirtualDesktopManagement(pvdName, pvdVersion);
+    if (!waylandPvdm->isValid()) {
+        // TODO: Delete all the wayland stuff and do some sort of message saying
+        // Wayland virtual desktop management won't be available'
+    }
+    connect(waylandConn, &ConnectionThread::connectionDied, waylandPvdm, &PlasmaVirtualDesktopManagement::destroy);
+
+    // Set up PlasmaWindowManagement
+    waylandPwm = waylandReg->createPlasmaWindowManagement(pwmName, pwmVersion);
+    if (!waylandPwm->isValid()) {
+        // TODO: Delete all the wayland stuff and do some sort of message saying
+        // Wayland window management won't be available'
+    }
+    connect(waylandConn, &ConnectionThread::connectionDied, waylandPwm, &PlasmaWindowManagement::destroy);
 }
 
 void VirtualDesktopBar::requestDesktopInfoList() {
     sendDesktopInfoList();
 }
 
-void VirtualDesktopBar::showDesktop(int number) {
-    KWindowSystem::setCurrentDesktop(number);
+void VirtualDesktopBar::showDesktop(QVariant d) {
+    vdi->requestActivate(d);
 }
 
 void VirtualDesktopBar::addDesktop(unsigned /*position*/) {
-    netRootInfo.setNumberOfDesktops(KWindowSystem::numberOfDesktops() + 1);
+    vdi->requestCreateDesktop(vdi->numberOfDesktops());
 
     if (!cfg_AddingDesktopsExecuteCommand.isEmpty()) {
         QTimer::singleShot(100, [=] {
@@ -44,48 +164,31 @@ void VirtualDesktopBar::addDesktop(unsigned /*position*/) {
     }
 }
 
+#include <iostream>
 void VirtualDesktopBar::removeDesktop(int number) {
-    auto reply = dbusInterface.call("removeDesktop", getDesktopInfo(number).id);
+    if (vdi->numberOfDesktops() == 1) { return; };
 
-    if (reply.type() == QDBusMessage::ErrorMessage) {
-        if (number == KWindowSystem::numberOfDesktops()) {
-            netRootInfo.setNumberOfDesktops(KWindowSystem::numberOfDesktops() - 1);
-        } else {
-            tryAddEmptyDesktopLock = true;
-            tryRemoveEmptyDesktopsLock = true;
-            tryRenameEmptyDesktopsLock = true;
-            sendDesktopInfoListLock = true;
-
-            QList<QString> desktopNameList;
-            QList<KWindowInfo> windowInfoList;
-            for (int i = number + 1; i <= KWindowSystem::numberOfDesktops(); i++) {
-                desktopNameList << KWindowSystem::desktopName(i);
-                windowInfoList.append(getWindowInfoList(i));
-            }
-
-            for (int i = number, j = 0; i <= KWindowSystem::numberOfDesktops() - 1; i++, j++) {
-                renameDesktop(i, desktopNameList[j]);
-            }
-
-            for (auto& windowInfo : windowInfoList) {
-                KWindowSystem::setOnDesktop(windowInfo.win(), windowInfo.desktop() - 1);
-            }
-
-            tryAddEmptyDesktopLock = false;
-            tryRemoveEmptyDesktopsLock = false;
-            tryRenameEmptyDesktopsLock = false;
-            sendDesktopInfoListLock = false;
-
-            netRootInfo.setNumberOfDesktops(KWindowSystem::numberOfDesktops() - 1);
-        }
+    if (KWindowSystem::isPlatformWayland())
+        vdi->requestRemoveDesktop(number);
+    else if (KWindowSystem::isPlatformX11()) {
+        std::cout << "Number: " << number << std::endl;
+        std::cout << "Id: " << getDesktopInfo(number).id.toStdString() << std::endl;
+        dbusInterface.call("removeDesktop", getDesktopInfo(number).id);
     }
 }
 
 void VirtualDesktopBar::renameDesktop(int number, QString name) {
     auto reply = dbusInterface.call("setDesktopName", getDesktopInfo(number).id, name);
 
-    if (reply.type() == QDBusMessage::ErrorMessage) {
-        KWindowSystem::setDesktopName(number, name);
+    if (KWindowSystem::isPlatformWayland() && reply.type() == QDBusMessage::ErrorMessage) {
+        // TODO: Something for wayland??  I don't see a way to rename an
+        // existing wayland virtual desktop, though it must exist because you can do it
+        // from settings.  A workaround may be to delete and recreate the desktop with
+        // a new name and move all the windows to the new desktop.  Let's see how often
+        // the dbus call fails though.
+    }
+    else if (reply.type() == QDBusMessage::ErrorMessage) {
+        KX11Extras::setDesktopName(number, name);
     }
 }
 
@@ -93,71 +196,75 @@ void VirtualDesktopBar::replaceDesktops(int number1, int number2) {
     if (number1 == number2) {
         return;
     }
-    if (number1 < 1 || number1 > KWindowSystem::numberOfDesktops()) {
+    if (number1 < 1 || number1 > vdi->numberOfDesktops()) {
         return;
     }
-    if (number2 < 1 || number2 > KWindowSystem::numberOfDesktops()) {
+    if (number2 < 1 || number2 > vdi->numberOfDesktops()) {
         return;
     }
 
     auto desktopInfo1 = getDesktopInfo(number1);
     auto desktopInfo2 = getDesktopInfo(number2);
 
-    auto windowInfoList1 = getWindowInfoList(desktopInfo1.number);
-    auto windowInfoList2 = getWindowInfoList(desktopInfo2.number);
+    auto windowInfoList1 = getWindowInfoList(desktopInfo1.id);
+    auto windowInfoList2 = getWindowInfoList(desktopInfo2.id);
 
+    // TODO:  Some stuff for Wayland???
     if (desktopInfo1.isCurrent) {
-        KWindowSystem::setCurrentDesktop(desktopInfo2.number);
+        KX11Extras::setCurrentDesktop(desktopInfo2.number);
     } else if (desktopInfo2.isCurrent) {
-        KWindowSystem::setCurrentDesktop(desktopInfo1.number);
+        KX11Extras::setCurrentDesktop(desktopInfo1.number);
     }
 
-    for (auto& windowInfo : windowInfoList2) {
-        KWindowSystem::setOnDesktop(windowInfo.win(), desktopInfo1.number);
+    for (auto& windowInfo : windowInfoList2.x11WindowInfo) {
+        KX11Extras::setOnDesktop(windowInfo.win(), desktopInfo1.number);
     }
 
-    for (auto& windowInfo : windowInfoList1) {
-        KWindowSystem::setOnDesktop(windowInfo.win(), desktopInfo2.number);
+    for (auto& windowInfo : windowInfoList1.x11WindowInfo) {
+        KX11Extras::setOnDesktop(windowInfo.win(), desktopInfo2.number);
     }
 
     renameDesktop(desktopInfo1.number, desktopInfo2.name);
     renameDesktop(desktopInfo2.number, desktopInfo1.name);
 }
 
-void VirtualDesktopBar::setUpSignals() {
-    setUpKWinSignals();
-    setUpInternalSignals();
+void VirtualDesktopBar::setupSignals() {
+    setupKWinSignals();
+    setupInternalSignals();
 }
 
-void VirtualDesktopBar::setUpKWinSignals() {
-    QObject::connect(KWindowSystem::self(), &KWindowSystem::currentDesktopChanged, this, [&] {
+void VirtualDesktopBar::setupKWinSignals() {
+    QObject::connect(vdi, &TaskManager::VirtualDesktopInfo::currentDesktopChanged, this, [&] {
         updateLocalDesktopNumbers();
         processChanges([&] { sendDesktopInfoList(); }, sendDesktopInfoListLock);
     });
 
-    QObject::connect(KWindowSystem::self(), &KWindowSystem::numberOfDesktopsChanged, this, [&] {
+    QObject::connect(vdi, &TaskManager::VirtualDesktopInfo::numberOfDesktopsChanged, this, [&] {
         processChanges([&] { tryAddEmptyDesktop(); }, tryAddEmptyDesktopLock);
         processChanges([&] { tryRemoveEmptyDesktops(); }, tryRemoveEmptyDesktopsLock);
         processChanges([&] { tryRenameEmptyDesktops(); }, tryRenameEmptyDesktopsLock);
         processChanges([&] { sendDesktopInfoList(); }, sendDesktopInfoListLock);
     });
 
-    QObject::connect(KWindowSystem::self(), &KWindowSystem::desktopNamesChanged, this, [&] {
+    QObject::connect(vdi, &TaskManager::VirtualDesktopInfo::desktopNamesChanged, this, [&] {
         processChanges([&] { sendDesktopInfoList(); }, sendDesktopInfoListLock);
     });
 
-    QObject::connect(KWindowSystem::self(), static_cast<void (KWindowSystem::*)(WId, NET::Properties, NET::Properties2)>
-                                            (&KWindowSystem::windowChanged), this, [&](WId, NET::Properties properties, NET::Properties2) {
-        if (properties & NET::WMState) {
-            processChanges([&] { tryAddEmptyDesktop(); }, tryAddEmptyDesktopLock);
-            processChanges([&] { tryRemoveEmptyDesktops(); }, tryRemoveEmptyDesktopsLock);
-            processChanges([&] { tryRenameEmptyDesktops(); }, tryRenameEmptyDesktopsLock);
-            processChanges([&] { sendDesktopInfoList(); }, sendDesktopInfoListLock);
-        }
-    });
+    if (KWindowSystem::isPlatformX11()) {
+        // NOTE: Not sure what this is for...
+        QObject::connect(KX11Extras::self(), static_cast<void (KX11Extras::*)(WId, NET::Properties, NET::Properties2)>
+                                                (&KX11Extras::windowChanged), this, [&](WId, NET::Properties properties, NET::Properties2) {
+            if (properties & NET::WMState) {
+                processChanges([&] { tryAddEmptyDesktop(); }, tryAddEmptyDesktopLock);
+                processChanges([&] { tryRemoveEmptyDesktops(); }, tryRemoveEmptyDesktopsLock);
+                processChanges([&] { tryRenameEmptyDesktops(); }, tryRenameEmptyDesktopsLock);
+                processChanges([&] { sendDesktopInfoList(); }, sendDesktopInfoListLock);
+            }
+        });
+    }
 }
 
-void VirtualDesktopBar::setUpInternalSignals() {
+void VirtualDesktopBar::setupInternalSignals() {
     QObject::connect(this, &VirtualDesktopBar::cfg_EmptyDesktopsRenameAsChanged, this, [&] {
         tryRenameEmptyDesktops();
     });
@@ -172,14 +279,14 @@ void VirtualDesktopBar::setUpInternalSignals() {
     });
 }
 
-void VirtualDesktopBar::setUpGlobalKeyboardShortcuts() {
+void VirtualDesktopBar::setupGlobalKeyboardShortcuts() {
     QString prefix = "Virtual Desktop Bar - ";
     actionCollection = new KActionCollection(this, QStringLiteral("kwin"));
 
     actionSwitchToRecentDesktop = actionCollection->addAction(QStringLiteral("switchToRecentDesktop"));
     actionSwitchToRecentDesktop->setText(prefix + "Switch to Recent Desktop");
     QObject::connect(actionSwitchToRecentDesktop, &QAction::triggered, this, [&] {
-        showDesktop(mostRecentDesktopNumber);
+        showDesktop(mostRecentDesktop);
     });
     KGlobalAccel::setGlobalShortcut(actionSwitchToRecentDesktop, QKeySequence());
 
@@ -196,7 +303,7 @@ void VirtualDesktopBar::setUpGlobalKeyboardShortcuts() {
     actionRemoveLastDesktop->setText(prefix + "Remove Last Desktop");
     QObject::connect(actionRemoveLastDesktop, &QAction::triggered, this, [&] {
         if (!cfg_DynamicDesktopsEnable) {
-            removeDesktop(KWindowSystem::numberOfDesktops());
+            removeDesktop(KWindowSystem::isPlatformWayland() ? vdi->numberOfDesktops() - 1 : vdi->numberOfDesktops());
         }
     });
     KGlobalAccel::setGlobalShortcut(actionRemoveLastDesktop, QKeySequence());
@@ -205,7 +312,7 @@ void VirtualDesktopBar::setUpGlobalKeyboardShortcuts() {
     actionRemoveCurrentDesktop->setText(prefix + "Remove Current Desktop");
     QObject::connect(actionRemoveCurrentDesktop, &QAction::triggered, this, [&] {
         if (!cfg_DynamicDesktopsEnable) {
-            removeDesktop(KWindowSystem::currentDesktop());
+            removeDesktop(vdi->position(vdi->currentDesktop()));
         }
     });
     KGlobalAccel::setGlobalShortcut(actionRemoveCurrentDesktop, QKeySequence());
@@ -217,27 +324,28 @@ void VirtualDesktopBar::setUpGlobalKeyboardShortcuts() {
     });
     KGlobalAccel::setGlobalShortcut(actionRenameCurrentDesktop, QKeySequence());
 
+    // TODO: Figure out how to make these work on Wayland
     actionMoveCurrentDesktopToLeft = actionCollection->addAction(QStringLiteral("moveCurrentDesktopToLeft"));
     actionMoveCurrentDesktopToLeft->setText(prefix + "Move Current Desktop to Left");
-    QObject::connect(actionMoveCurrentDesktopToLeft, &QAction::triggered, this, [&] {
-        replaceDesktops(KWindowSystem::currentDesktop(),
-                        KWindowSystem::currentDesktop() - 1);
-    });
+    /*QObject::connect(actionMoveCurrentDesktopToLeft, &QAction::triggered, this, [&] {
+        replaceDesktops(KX11Extras::currentDesktop(),
+                        KX11Extras::currentDesktop() - 1);
+    });*/
     KGlobalAccel::setGlobalShortcut(actionMoveCurrentDesktopToLeft, QKeySequence());
 
     actionMoveCurrentDesktopToRight = actionCollection->addAction(QStringLiteral("moveCurrentDesktopToRight"));
     actionMoveCurrentDesktopToRight->setText(prefix + "Move Current Desktop to Right");
-    QObject::connect(actionMoveCurrentDesktopToRight, &QAction::triggered, this, [&] {
-        replaceDesktops(KWindowSystem::currentDesktop(),
-                        KWindowSystem::currentDesktop() + 1);
-    });
+    /*QObject::connect(actionMoveCurrentDesktopToRight, &QAction::triggered, this, [&] {
+        replaceDesktops(KX11Extras::currentDesktop(),
+                        KX11Extras::currentDesktop() + 1);
+    });*/
     KGlobalAccel::setGlobalShortcut(actionMoveCurrentDesktopToRight, QKeySequence());
 }
 
 void VirtualDesktopBar::processChanges(std::function<void()> callback, bool& lock) {
     if (!lock) {
         lock = true;
-        QTimer::singleShot(1, [this, callback, &lock] {
+        QTimer::singleShot(1, [callback, &lock] {
             lock = false;
             callback();
         });
@@ -246,7 +354,8 @@ void VirtualDesktopBar::processChanges(std::function<void()> callback, bool& loc
 
 DesktopInfo VirtualDesktopBar::getDesktopInfo(int number) {
     for (auto& desktopInfo : getDesktopInfoList()) {
-        if (desktopInfo.number == number) {
+        if ((KWindowSystem::isPlatformWayland() && desktopInfo.number == number) ||
+            (KWindowSystem::isPlatformX11() && desktopInfo.number == number + 1)) {
             return desktopInfo;
         }
     }
@@ -265,72 +374,88 @@ DesktopInfo VirtualDesktopBar::getDesktopInfo(QString id) {
 QList<DesktopInfo> VirtualDesktopBar::getDesktopInfoList(bool extraInfo) {
     QList<DesktopInfo> desktopInfoList;
 
-    // Getting info about desktops through the KWin's D-Bus service here
-    auto reply = dbusInterface.call("Get", dbusInterfaceName, "desktops");
+    auto desktopIDs = vdi->desktopIds();
+    auto desktopNames = vdi->desktopNames();
+    for (int i = 0; i < desktopIDs.length(); i++) {
+        DesktopInfo di;
+        di.id = desktopIDs[i].toString();
+        di.name = desktopNames[i];
+        di.number = KWindowSystem::isPlatformX11() ? i + 1 : i;
 
-    if (reply.type() == QDBusMessage::ErrorMessage) {
-        for (int i = 1; i <= KWindowSystem::numberOfDesktops(); i++) {
-            DesktopInfo desktopInfo;
-            desktopInfo.id = i;
-            desktopInfo.number = i;
-            desktopInfo.name = KWindowSystem::desktopName(i);
-
-            desktopInfoList << desktopInfo;
-        }
-    } else {
-        // Extracting data from the D-Bus reply message here
-        // More details at https://stackoverflow.com/a/20206377
-        auto something = reply.arguments().at(0).value<QDBusVariant>();
-        auto somethingSomething = something.variant().value<QDBusArgument>();
-        somethingSomething >> desktopInfoList;
+        desktopInfoList << di;
     }
 
     for (auto& desktopInfo : desktopInfoList) {
-        desktopInfo.isCurrent = desktopInfo.number == KWindowSystem::currentDesktop();
+        desktopInfo.isCurrent = desktopInfo.id == vdi->currentDesktop().toString();
 
         if (!extraInfo) {
             continue;
         }
 
-        auto windowInfoList = getWindowInfoList(desktopInfo.number);
+        auto wInfo = getWindowInfoList(desktopInfo.id);
 
-        desktopInfo.isEmpty = windowInfoList.isEmpty();
+        if (KWindowSystem::isPlatformWayland()) {
+            desktopInfo.isEmpty = wInfo.waylandWindowInfo.isEmpty();
+            for (int i = 0; i < wInfo.waylandWindowInfo.length(); i++) {
+                auto& windowInfo = wInfo.waylandWindowInfo[i];
 
-        for (int i = 0; i < windowInfoList.length(); i++) {
-            auto& windowInfo = windowInfoList[i];
+                if (!desktopInfo.isUrgent)
+                    desktopInfo.isUrgent = windowInfo->isDemandingAttention();
 
-            if (!desktopInfo.isUrgent) {
-                desktopInfo.isUrgent = windowInfo.hasState(NET::DemandsAttention);
+                QString windowName = windowInfo->title();
+                int separatorPosition = qMax(windowName.lastIndexOf(" - "),
+                                            qMax(windowName.lastIndexOf(" – "),
+                                                windowName.lastIndexOf(" — ")));
+                if (separatorPosition >= 0) {
+                    separatorPosition += 3;
+                    int length = windowName.length() - separatorPosition;
+                    QStringRef substringRef(&windowName, separatorPosition, length);
+                    windowName = substringRef.toString().trimmed();
+                }
+
+                if (i == 0) {
+                    desktopInfo.activeWindowName = windowName;
+                }
+
+                desktopInfo.windowNameList << windowName;
             }
+        }
+        else if (KWindowSystem::isPlatformX11()) {
+            desktopInfo.isEmpty = wInfo.x11WindowInfo.isEmpty();
+            for (int i = 0; i < wInfo.x11WindowInfo.length(); i++) {
+                auto& windowInfo = wInfo.x11WindowInfo[i];
 
-            QString windowName = windowInfo.name();
-            int separatorPosition = qMax(windowName.lastIndexOf(" - "),
-                                         qMax(windowName.lastIndexOf(" – "),
-                                              windowName.lastIndexOf(" — ")));
-            if (separatorPosition >= 0) {
-                separatorPosition += 3;
-                int length = windowName.length() - separatorPosition;
-                QStringRef substringRef(&windowName, separatorPosition, length);
-                windowName = substringRef.toString().trimmed();
+                if (!desktopInfo.isUrgent)
+                    desktopInfo.isUrgent = windowInfo.hasState(NET::DemandsAttention);
+
+                QString windowName = windowInfo.name();
+                int separatorPosition = qMax(windowName.lastIndexOf(" - "),
+                                            qMax(windowName.lastIndexOf(" – "),
+                                                windowName.lastIndexOf(" — ")));
+                if (separatorPosition >= 0) {
+                    separatorPosition += 3;
+                    int length = windowName.length() - separatorPosition;
+                    QStringRef substringRef(&windowName, separatorPosition, length);
+                    windowName = substringRef.toString().trimmed();
+                }
+
+                if (i == 0) {
+                    desktopInfo.activeWindowName = windowName;
+                }
+
+                desktopInfo.windowNameList << windowName;
             }
-
-            if (i == 0) {
-                desktopInfo.activeWindowName = windowName;
-            }
-
-            desktopInfo.windowNameList << windowName;
         }
     }
 
     return desktopInfoList;
 }
 
-QList<KWindowInfo> VirtualDesktopBar::getWindowInfoList(int desktopNumber, bool ignoreScreens) {
-    QList<KWindowInfo> windowInfoList;
+QList<KWindowInfo>
+VirtualDesktopBar::getX11Windows(QString desktopId, bool ignoreScreens) {
+    QList<KWindowInfo> winInfo;
 
-    auto screenRect = QGuiApplication::screens().at(0)->geometry();
-
-    QList<WId> windowIds = KWindowSystem::stackingOrder();
+    QList<WId> windowIds = KX11Extras::stackingOrder();
     for (int i = windowIds.length() - 1; i >= 0; i--) {
         KWindowInfo windowInfo(windowIds[i], NET::WMState |
                                              NET::WMDesktop |
@@ -339,8 +464,7 @@ QList<KWindowInfo> VirtualDesktopBar::getWindowInfoList(int desktopNumber, bool 
                                              NET::WMName);
 
         // Skipping windows not present on the current desktops
-        if (windowInfo.desktop() != desktopNumber &&
-            windowInfo.desktop() != -1) {
+        if (!windowInfo.isOnDesktop(desktopId.toInt())) {
             continue;
         }
 
@@ -357,6 +481,7 @@ QList<KWindowInfo> VirtualDesktopBar::getWindowInfoList(int desktopNumber, bool 
             continue;
         }
 
+        auto screenRect = QGuiApplication::screens().at(0)->geometry();
         // Skipping windows not present on the current screen
         if (!ignoreScreens && cfg_MultipleScreensFilterOccupiedDesktops) {
             auto windowRect = windowInfo.geometry();
@@ -367,35 +492,100 @@ QList<KWindowInfo> VirtualDesktopBar::getWindowInfoList(int desktopNumber, bool 
             }
         }
 
-        windowInfoList << windowInfo;
+        winInfo << windowInfo;
     }
 
-    return windowInfoList;
+    return winInfo;
+}
+
+QList<PlasmaWindow *>
+VirtualDesktopBar::getWaylandWindows(QString desktopId, bool ignoreScreens) {
+    QList<PlasmaWindow *> winInfo;
+
+    for (auto &win : waylandPwm->windows()) {
+        if (win->plasmaVirtualDesktops().empty())
+            continue;
+
+        // Skip windows not present on the current desktops
+        if (!win->plasmaVirtualDesktops().contains(desktopId)) {
+            continue;
+        }
+
+        // Skip windows flagged SkipSwitcher or SkipTaskbar
+        if (win->skipSwitcher() || win->skipTaskbar()) {
+            continue;
+        }
+
+         // Skipping windows not present on the current screen
+        auto screenRect = QGuiApplication::screens().at(0)->geometry();
+        if (!ignoreScreens && cfg_MultipleScreensFilterOccupiedDesktops) {
+            auto windowRect = win->geometry();
+            auto intersectionRect = screenRect.intersected(windowRect);
+            if (intersectionRect.width() < windowRect.width() / 2 ||
+                intersectionRect.height() < windowRect.height() / 2) {
+                continue;
+            }
+        }
+
+        winInfo << win;
+    }
+
+    return winInfo;
+}
+
+WindowInfo
+VirtualDesktopBar::getWindowInfoList(QString desktopId, bool ignoreScreens) {
+    WindowInfo winInfo;
+    if (KWindowSystem::isPlatformWayland())
+        winInfo.waylandWindowInfo = getWaylandWindows(desktopId, ignoreScreens);
+    if (KWindowSystem::isPlatformX11())
+        winInfo.x11WindowInfo = getX11Windows(desktopId, ignoreScreens);
+
+    return winInfo;
 }
 
 QList<int> VirtualDesktopBar::getEmptyDesktopNumberList(bool noCheating) {
     QList<int> emptyDesktopNumberList;
 
-    for (int i = 1; i <= KWindowSystem::numberOfDesktops(); i++) {
-        auto windowInfoList = getWindowInfoList(i, true);
+    for (int i = 0; i <= vdi->numberOfDesktops(); i++) {
+        auto desktopInfo = getDesktopInfo(i);
+        auto wInfo = getWindowInfoList(desktopInfo.id, true);
 
         if (noCheating) {
-            if (windowInfoList.empty()) {
-                emptyDesktopNumberList << i;
+            if (KWindowSystem::isPlatformWayland()) {
+                if (wInfo.waylandWindowInfo.empty())
+                    emptyDesktopNumberList << i;
+            }
+            else if (KWindowSystem::isPlatformX11()) {
+                if (wInfo.x11WindowInfo.empty())
+                    emptyDesktopNumberList << i;
             }
             continue;
         }
 
         bool isConsideredEmpty = true;
-        for (auto& windowInfo : windowInfoList) {
-            if (windowInfo.desktop() == i) {
-                isConsideredEmpty = false;
-                break;
+        if (KWindowSystem::isPlatformWayland()) {
+            for (auto& windowInfo : wInfo.waylandWindowInfo) {
+                if (windowInfo->plasmaVirtualDesktops().contains(desktopInfo.id)) {
+                   isConsideredEmpty = false;
+                   break;
+                }
+            }
+            if (isConsideredEmpty) {
+                emptyDesktopNumberList << i;
             }
         }
+        else if (KWindowSystem::isPlatformX11()) {
+            for (auto& windowInfo : wInfo.x11WindowInfo) {
+                if (windowInfo.desktop() == i + 1) {
+                    isConsideredEmpty = false;
+                    break;
+                }
+            }
 
-        if (isConsideredEmpty) {
-            emptyDesktopNumberList << i;
+            if (isConsideredEmpty) {
+                emptyDesktopNumberList << i;
+            }
         }
     }
 
@@ -422,9 +612,12 @@ void VirtualDesktopBar::tryAddEmptyDesktop() {
 void VirtualDesktopBar::tryRemoveEmptyDesktops() {
     if (cfg_DynamicDesktopsEnable) {
         auto emptyDesktopNumberList = getEmptyDesktopNumberList(false);
-        for (int i = 1; i < emptyDesktopNumberList.length(); i++) {
+        for (int i = 0; i < emptyDesktopNumberList.length(); i++) {
             int desktopNumber = emptyDesktopNumberList[i];
-            removeDesktop(desktopNumber);
+            if (KWindowSystem::isPlatformWayland())
+                removeDesktop(desktopNumber);
+            else if (KWindowSystem::isPlatformX11())
+                removeDesktop(desktopNumber + 1);
         }
     }
 }
@@ -433,15 +626,18 @@ void VirtualDesktopBar::tryRenameEmptyDesktops() {
     if (!cfg_EmptyDesktopsRenameAs.isEmpty()) {
         auto emptyDesktopNumberList = getEmptyDesktopNumberList();
         for (int desktopNumber : emptyDesktopNumberList) {
-            renameDesktop(desktopNumber, cfg_EmptyDesktopsRenameAs);
+            if (KWindowSystem::isPlatformWayland())
+                renameDesktop(desktopNumber, cfg_EmptyDesktopsRenameAs);
+            else if (KWindowSystem::isPlatformX11())
+                renameDesktop(desktopNumber + 1, cfg_EmptyDesktopsRenameAs);
         }
     }
 }
 
 void VirtualDesktopBar::updateLocalDesktopNumbers() {
-    int n = KWindowSystem::currentDesktop();
-    if (currentDesktopNumber != n) {
-        mostRecentDesktopNumber = currentDesktopNumber;
+    QVariant d = vdi->currentDesktop();
+    if (currentDesktop != d) {
+        mostRecentDesktop = currentDesktop;
     }
-    currentDesktopNumber = n;
+    currentDesktop = d;
 }
