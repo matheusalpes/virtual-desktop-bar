@@ -209,19 +209,31 @@ void VirtualDesktopBar::replaceDesktops(int number1, int number2) {
     auto windowInfoList1 = getWindowInfoList(desktopInfo1.id);
     auto windowInfoList2 = getWindowInfoList(desktopInfo2.id);
 
-    // TODO:  Some stuff for Wayland???
-    if (desktopInfo1.isCurrent) {
-        KX11Extras::setCurrentDesktop(desktopInfo2.number);
-    } else if (desktopInfo2.isCurrent) {
-        KX11Extras::setCurrentDesktop(desktopInfo1.number);
-    }
 
-    for (auto& windowInfo : windowInfoList2.x11WindowInfo) {
-        KX11Extras::setOnDesktop(windowInfo.win(), desktopInfo1.number);
-    }
+    if (desktopInfo1.isCurrent)
+        vdi->requestActivate(desktopInfo2.id);
+    else if (desktopInfo2.isCurrent)
+        vdi->requestActivate(desktopInfo1.id);
 
-    for (auto& windowInfo : windowInfoList1.x11WindowInfo) {
-        KX11Extras::setOnDesktop(windowInfo.win(), desktopInfo2.number);
+    if (KWindowSystem::isPlatformWayland()) {
+        for (auto& winInfo : windowInfoList2.waylandWindowInfo) {
+            winInfo->requestEnterVirtualDesktop(desktopInfo1.id);
+            winInfo->requestLeaveVirtualDesktop(desktopInfo2.id);
+        }
+
+        for (auto& winInfo : windowInfoList1.waylandWindowInfo) {
+            winInfo->requestEnterVirtualDesktop(desktopInfo2.id);
+            winInfo->requestLeaveVirtualDesktop(desktopInfo1.id);
+        }
+    }
+    else if (KWindowSystem::isPlatformX11()) {
+        for (auto& winInfo : windowInfoList2.x11WindowInfo) {
+            KX11Extras::setOnDesktop(winInfo.win(), desktopInfo1.number);
+        }
+
+        for (auto& winInfo : windowInfoList1.x11WindowInfo) {
+            KX11Extras::setOnDesktop(winInfo.win(), desktopInfo2.number);
+        }
     }
 
     renameDesktop(desktopInfo1.number, desktopInfo2.name);
@@ -327,18 +339,18 @@ void VirtualDesktopBar::setupGlobalKeyboardShortcuts() {
     // TODO: Figure out how to make these work on Wayland
     actionMoveCurrentDesktopToLeft = actionCollection->addAction(QStringLiteral("moveCurrentDesktopToLeft"));
     actionMoveCurrentDesktopToLeft->setText(prefix + "Move Current Desktop to Left");
-    /*QObject::connect(actionMoveCurrentDesktopToLeft, &QAction::triggered, this, [&] {
+    QObject::connect(actionMoveCurrentDesktopToLeft, &QAction::triggered, this, [&] {
         replaceDesktops(KX11Extras::currentDesktop(),
                         KX11Extras::currentDesktop() - 1);
-    });*/
+    });
     KGlobalAccel::setGlobalShortcut(actionMoveCurrentDesktopToLeft, QKeySequence());
 
     actionMoveCurrentDesktopToRight = actionCollection->addAction(QStringLiteral("moveCurrentDesktopToRight"));
     actionMoveCurrentDesktopToRight->setText(prefix + "Move Current Desktop to Right");
-    /*QObject::connect(actionMoveCurrentDesktopToRight, &QAction::triggered, this, [&] {
+    QObject::connect(actionMoveCurrentDesktopToRight, &QAction::triggered, this, [&] {
         replaceDesktops(KX11Extras::currentDesktop(),
                         KX11Extras::currentDesktop() + 1);
-    });*/
+    });
     KGlobalAccel::setGlobalShortcut(actionMoveCurrentDesktopToRight, QKeySequence());
 }
 

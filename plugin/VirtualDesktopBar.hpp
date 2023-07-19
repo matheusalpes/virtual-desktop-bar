@@ -16,7 +16,6 @@
 #include <KWayland/Client/connection_thread.h>
 #include <KWayland/Client/registry.h>
 
-//#include <waylandtasksmodel.h>
 #include <virtualdesktopinfo.h>
 #include "DesktopInfo.hpp"
 
@@ -77,10 +76,6 @@ private:
     qint32 pvdName = 0, pvdVersion = 0;
     qint32 pwmName = 0, pwmVersion = 0;
 
-    // Window info lists
-    //QList<KWindowInfo> x11WindowInfo;
-    //QList<KWayland::Client::PlasmaWindow *> waylandWindowInfo;
-    
     QDBusInterface dbusInterface;
     QString dbusInterfaceName;
 
@@ -93,10 +88,7 @@ private:
     DesktopInfo getDesktopInfo(QString id);
     QList<DesktopInfo> getDesktopInfoList(bool extraInfo = false);
     QList<int> getEmptyDesktopNumberList(bool noCheating = true);
-    //void getWindowInfoList(QString desktopId, bool ignoreScreens = false);
     WindowInfo getWindowInfoList(QString desktopId, bool ignoreScreens = false);
-    //void getX11Windows(QString desktopId, bool ignoreScreens);
-    //void getWaylandWindows(QString desktopId, bool ignoreScreens);
     QList<KWindowInfo> getX11Windows(QString desktopId, bool ignoreScreens);
     QList<KWayland::Client::PlasmaWindow *> getWaylandWindows(QString desktopId, bool ignoreScreens);
 

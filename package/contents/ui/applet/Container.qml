@@ -30,7 +30,7 @@ GridLayout {
 
     AddDesktopButton {}
 
-    readonly property int pressToDragDuration: 300
+    readonly property int pressToDragDuration: 150
 
     property bool isDragging: false
     property Item draggedDesktopButton
@@ -131,12 +131,11 @@ GridLayout {
                 }
             }
 
-            if (desktopNumber > 0) {
+            if (desktopNumber >= 0) {
                 if (config.TooltipsEnable) {
                     tooltip.visible = false;
                 }
-
-                backend.showDesktop(desktopNumber);
+                backend.showDesktop(desktopButtonList[desktopNumber].id);
             }
         }
     }
@@ -168,11 +167,10 @@ GridLayout {
             desktopButtonList.push(desktopButton);
         }
 
-        if (!init && difference != 0 &&
-            !config.DynamicDesktopsEnable) {
+        if (!init && difference != 0 && !config.DynamicDesktopsEnable) {
             if (config.AddingDesktopsSwitchTo) {
                 Utils.delay(100, function() {
-                    backend.showDesktop(desktopButtonList.length);
+                    backend.showDesktop(desktopButtonList[desktopButtonList.length - 1].id);
                 });
             }
             if (config.AddingDesktopsPromptToRename) {
