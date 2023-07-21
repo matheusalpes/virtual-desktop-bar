@@ -171,8 +171,6 @@ void VirtualDesktopBar::removeDesktop(int number) {
     if (KWindowSystem::isPlatformWayland())
         vdi->requestRemoveDesktop(number);
     else if (KWindowSystem::isPlatformX11()) {
-        std::cout << "Number: " << number << std::endl;
-        std::cout << "Id: " << getDesktopInfo(number).id.toStdString() << std::endl;
         dbusInterface.call("removeDesktop", getDesktopInfo(number).id);
     }
 }
@@ -336,7 +334,6 @@ void VirtualDesktopBar::setupGlobalKeyboardShortcuts() {
     });
     KGlobalAccel::setGlobalShortcut(actionRenameCurrentDesktop, QKeySequence());
 
-    // TODO: Figure out how to make these work on Wayland
     actionMoveCurrentDesktopToLeft = actionCollection->addAction(QStringLiteral("moveCurrentDesktopToLeft"));
     actionMoveCurrentDesktopToLeft->setText(prefix + "Move Current Desktop to Left");
     QObject::connect(actionMoveCurrentDesktopToLeft, &QAction::triggered, this, [&] {
@@ -463,6 +460,18 @@ QList<DesktopInfo> VirtualDesktopBar::getDesktopInfoList(bool extraInfo) {
     return desktopInfoList;
 }
 
+bool
+VirtualDesktopBar::windowIntersectsScreen(QRect winRect) {
+    auto screenRect = QGuiApplication::screens().at(0)->geometry();
+    auto intersectionRect = screenRect.intersected(winRect);
+    if (intersectionRect.width() < winRect.width() / 2 ||
+        intersectionRect.height() < winRect.height() / 2) {
+        return false;
+    }
+
+    return true;
+}
+
 QList<KWindowInfo>
 VirtualDesktopBar::getX11Windows(QString desktopId, bool ignoreScreens) {
     QList<KWindowInfo> winInfo;
@@ -493,15 +502,10 @@ VirtualDesktopBar::getX11Windows(QString desktopId, bool ignoreScreens) {
             continue;
         }
 
-        auto screenRect = QGuiApplication::screens().at(0)->geometry();
         // Skipping windows not present on the current screen
         if (!ignoreScreens && cfg_MultipleScreensFilterOccupiedDesktops) {
-            auto windowRect = windowInfo.geometry();
-            auto intersectionRect = screenRect.intersected(windowRect);
-            if (intersectionRect.width() < windowRect.width() / 2 ||
-                intersectionRect.height() < windowRect.height() / 2) {
+            if (!windowIntersectsScreen(windowInfo.geometry()))
                 continue;
-            }
         }
 
         winInfo << windowInfo;
@@ -515,28 +519,26 @@ VirtualDesktopBar::getWaylandWindows(QString desktopId, bool ignoreScreens) {
     QList<PlasmaWindow *> winInfo;
 
     for (auto &win : waylandPwm->windows()) {
-        if (win->plasmaVirtualDesktops().empty())
+        // Skip windows with no title.  Not sure why this happens, but several windows
+        // with no title are on all desktops
+        if (win->title().isEmpty())
             continue;
-
-        // Skip windows not present on the current desktops
-        if (!win->plasmaVirtualDesktops().contains(desktopId)) {
-            continue;
-        }
 
         // Skip windows flagged SkipSwitcher or SkipTaskbar
         if (win->skipSwitcher() || win->skipTaskbar()) {
             continue;
         }
 
-         // Skipping windows not present on the current screen
-        auto screenRect = QGuiApplication::screens().at(0)->geometry();
+        // Skip windows not present on the current desktops
+        if (!win->isOnAllDesktops() &&
+            !win->plasmaVirtualDesktops().contains(desktopId)) {
+            continue;
+        }
+
+        // Skipping windows not present on the current screen
         if (!ignoreScreens && cfg_MultipleScreensFilterOccupiedDesktops) {
-            auto windowRect = win->geometry();
-            auto intersectionRect = screenRect.intersected(windowRect);
-            if (intersectionRect.width() < windowRect.width() / 2 ||
-                intersectionRect.height() < windowRect.height() / 2) {
+            if (!windowIntersectsScreen(win->geometry()))
                 continue;
-            }
         }
 
         winInfo << win;

@@ -91,7 +91,7 @@ private:
     WindowInfo getWindowInfoList(QString desktopId, bool ignoreScreens = false);
     QList<KWindowInfo> getX11Windows(QString desktopId, bool ignoreScreens);
     QList<KWayland::Client::PlasmaWindow *> getWaylandWindows(QString desktopId, bool ignoreScreens);
-
+    bool windowIntersectsScreen(QRect winRect);
     void setCurrentDesktop(qint32 number);
 
     QString cfg_EmptyDesktopsRenameAs;
