@@ -110,13 +110,14 @@ void VirtualDesktopBar::initWaylandConnection() {
     waylandConn->moveToThread(connThread);
     connThread->start();
 
-    bool isReady = false;
+    std::atomic_bool isReady { false };
+    std::atomic_bool failed { false };
     connect(waylandConn, &ConnectionThread::connected, [&isReady] {
         isReady = true;
     });
 
-    connect(waylandConn, &ConnectionThread::failed, [&isReady] {
-        isReady = true;
+    connect(waylandConn, &ConnectionThread::failed, [&isReady, &failed] {
+        failed = isReady = true;
     });
 
     waylandConn->initConnection();
@@ -126,22 +127,25 @@ void VirtualDesktopBar::initWaylandConnection() {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
-    initWaylandRegistry();
+    if (!failed) {
+        initWaylandRegistry();
 
-    // Set up PlasmaVirtualDesktopManagement
-    waylandPvdm = waylandReg->createPlasmaVirtualDesktopManagement(pvdName, pvdVersion);
-    if (!waylandPvdm->isValid()) {
-        // TODO: Delete all the wayland stuff and do some sort of message saying
-        // Wayland virtual desktop management won't be available'
-    }
-    connect(waylandConn, &ConnectionThread::connectionDied, waylandPvdm, &PlasmaVirtualDesktopManagement::destroy);
+        // Set up PlasmaVirtualDesktopManagement
+        waylandPvdm = waylandReg->createPlasmaVirtualDesktopManagement(pvdName, pvdVersion);
+        if (!waylandPvdm->isValid()) {
+            // TODO: Delete all the wayland stuff and do some sort of message saying
+            // Wayland virtual desktop management won't be available'
+        }
+        connect(waylandConn, &ConnectionThread::connectionDied, waylandPvdm, &PlasmaVirtualDesktopManagement::destroy);
 
-    // Set up PlasmaWindowManagement
-    waylandPwm = waylandReg->createPlasmaWindowManagement(pwmName, pwmVersion);
-    if (!waylandPwm->isValid()) {
-        // TODO: Delete all the wayland stuff and do some sort of message saying
-        // Wayland window management won't be available'
+        // Set up PlasmaWindowManagement
+        waylandPwm = waylandReg->createPlasmaWindowManagement(pwmName, pwmVersion);
+        if (!waylandPwm->isValid()) {
+            // TODO: Delete all the wayland stuff and do some sort of message saying
+            // Wayland window management won't be available'
+        }
     }
+
     connect(waylandConn, &ConnectionThread::connectionDied, waylandPwm, &PlasmaWindowManagement::destroy);
 }
 
@@ -561,7 +565,7 @@ VirtualDesktopBar::getWindowInfoList(QString desktopId, bool ignoreScreens) {
 QList<int> VirtualDesktopBar::getEmptyDesktopNumberList(bool noCheating) {
     QList<int> emptyDesktopNumberList;
 
-    for (int i = 0; i <= vdi->numberOfDesktops(); i++) {
+    for (int i = 0; i < vdi->numberOfDesktops(); i++) {
         auto desktopInfo = getDesktopInfo(i);
         auto wInfo = getWindowInfoList(desktopInfo.id, true);
 
